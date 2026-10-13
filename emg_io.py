@@ -130,7 +130,10 @@ def resample_recording(rec: pd.DataFrame, fs: float = MYO_FS) -> pd.DataFrame:
 
 BRAINACCESS_EXTENSIONS = (".fif", ".fif.gz", ".edf", ".bdf", ".csv")
 # Auxiliary channels written by the BrainAccess SDK that are not EMG.
-NON_EMG_HINTS = ("sample", "accel", "gyro", "streaming", "digital", "marker", "trigger", "stim", "time", "annotation")
+NON_EMG_HINTS = (
+    "sample", "accel", "gyro", "streaming", "digital", "marker", "trigger", "stim", "time", "annotation",
+    "contact", "battery", "unnamed",
+)
 
 
 @dataclass
@@ -142,6 +145,11 @@ class EMGRecording:
     ch_names: List[str]
     annotations: pd.DataFrame = field(default_factory=lambda: pd.DataFrame(columns=["onset_s", "duration_s", "label"]))
     source: Optional[Path] = None
+    dropout: Optional[np.ndarray] = None  # True where samples were lost in transmission (interpolated)
+
+    def __post_init__(self) -> None:
+        if self.dropout is None:
+            self.dropout = np.zeros(self.data.shape[1], dtype=bool)
 
     @property
     def times(self) -> np.ndarray:
@@ -194,6 +202,7 @@ def _load_mne(path: Path, channels: Optional[Sequence[str]]) -> EMGRecording:
 
 def _load_csv(path: Path, channels: Optional[Sequence[str]], fs: Optional[float], unit_scale: float) -> EMGRecording:
     df = pd.read_csv(path)
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]  # pandas index written by DataFrame.to_csv()
     lower = {c.lower(): c for c in df.columns}
 
     time_col = next((lower[c] for c in ("time", "timestamp", "time_s", "t", "seconds") if c in lower), None)
@@ -218,7 +227,18 @@ def _load_csv(path: Path, channels: Optional[Sequence[str]], fs: Optional[float]
             if c not in (time_col, label_col) and _is_emg_channel(c) and pd.api.types.is_numeric_dtype(df[c])
         ]
     data = df[list(channels)].to_numpy(dtype=float).T * unit_scale
-    return EMGRecording(data=data, fs=float(fs), ch_names=list(channels), annotations=annotations, source=path)
+
+    # BrainAccess CSV exports flag lost packets with Streaming = 0 and fill them with zeros.
+    # Interpolate across them so the zero blocks do not turn into step artefacts after filtering.
+    stream_col = lower.get("streaming")
+    dropout = np.zeros(data.shape[1], dtype=bool)
+    if stream_col is not None:
+        dropout = df[stream_col].to_numpy() == 0
+        if dropout.any() and not dropout.all():
+            good = np.flatnonzero(~dropout)
+            for row in data:
+                row[dropout] = np.interp(np.flatnonzero(dropout), good, row[good])
+    return EMGRecording(data=data, fs=float(fs), ch_names=list(channels), annotations=annotations, source=path, dropout=dropout)
 
 
 def load_brainaccess_recording(
@@ -236,7 +256,9 @@ def load_brainaccess_recording(
     * ``.edf`` / ``.bdf`` - read through MNE.
     * ``.csv`` - one column per channel, optional time column (s or ms) and an
       optional annotation/marker column. Values are assumed to be microvolts;
-      use ``csv_unit_scale`` to convert (e.g. 1e6 if the CSV is in volts).
+      use ``csv_unit_scale`` to convert (e.g. 1e6 if the CSV is in volts, as in
+      BrainAccess CSV exports). Rows flagged ``Streaming = 0`` (lost packets)
+      are interpolated and marked in ``EMGRecording.dropout``.
 
     Auxiliary channels (sample counter, accelerometer, streaming flag, ...) are
     dropped automatically unless `channels` is given.
